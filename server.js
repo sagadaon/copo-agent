@@ -42,6 +42,11 @@ if (!HMAC_CONFIGURED) {
 }
 const SECRET = HMAC_CONFIGURED ? HMAC_SECRET : 'local-test-only-dummy-secret-do-not-deploy';
 
+// Protocol-v1 preflight handshake (official /build spec): the platform sends
+// a signed preflight request and requires EXACTLY this body, signed with
+// x-agent-games-signature over the raw response body.
+const PREFLIGHT_BODY = { ok: true, protocolVersion: 'v1' };
+
 const seen = loadSeenSet(process.env.SEEN_FILE || './data/seen.json');
 const startedAt = Date.now();
 
@@ -132,7 +137,7 @@ const server = http.createServer(async (req, res) => {
     // Empty body + valid HMAC: a preflight/probe, not an error.
     if (raw.length === 0) {
       log({ msg: 'preflight_empty_body', path: url.pathname });
-      return sendJson(res, 200, { status: 'ok', preflight: true, service: 'agent-games-gatekeeper', time: new Date().toISOString() }, true);
+      return sendJson(res, 200, PREFLIGHT_BODY, true);
     }
     let envelope;
     try {
@@ -153,7 +158,7 @@ const server = http.createServer(async (req, res) => {
       envelope.mode === 'preflight');
     if (url.pathname === '/preflight' || isPreflightShape || !looksLikeTask) {
       log({ msg: 'preflight_ack', path: url.pathname, type: envelope && envelope.type });
-      return sendJson(res, 200, { status: 'ok', preflight: true, service: 'agent-games-gatekeeper', time: new Date().toISOString() }, true);
+      return sendJson(res, 200, PREFLIGHT_BODY, true);
     }
     if (!envelope || typeof envelope !== 'object' || envelope.type !== 'agent-games.proof-gatekeeper.v1') {
       return sendJson(res, 400, { error: 'unsupported_envelope', type: envelope && envelope.type }, true);
