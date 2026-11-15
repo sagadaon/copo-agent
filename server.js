@@ -38,6 +38,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { decide } from './decide.js';
+import { MODE as CHECK_MODE } from './onchain.js';
 import { loadSeenSet } from './seen.js';
 import { ensureCircuitsOnce as ensureGatekeeperCircuits } from './prove.js';
 import { loadConfig } from './config.js';
@@ -167,6 +168,7 @@ const server = http.createServer(async (req, res) => {
         protocolVersion: 'v1',
         uptime_s: Math.floor((Date.now() - startedAt) / 1000),
         hmac_configured: HMAC_CONFIGURED,
+        check_mode: CHECK_MODE,
         seen_count: seen.size,
         steal_configured: stealHandler !== null,
         commitment: stealHandler ? stealHandler.commitmentHex : null,

@@ -31,7 +31,7 @@
  *
  * ESM conversion of the standalone Gatekeeper onchain.js; logic unchanged.
  */
-export const MODE = (process.env.ZKVERIFY_CHECK_MODE || 'stub').toLowerCase();
+export const MODE = (process.env.ZKVERIFY_CHECK_MODE || 'stub').trim().toLowerCase();
 
 export async function verifyProofOnChain(/* { proof_tx, proof_vk, registered_vk } */) {
   if (MODE === 'mock') {
