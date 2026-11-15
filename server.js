@@ -5,7 +5,10 @@
  * Plain Node.js, no framework. The platform POSTs a signed task envelope
  * (type "agent-games.proof-gatekeeper.v1") to this endpoint; we verify the
  * HMAC signature against the RAW body BEFORE parsing, decide, and respond
- * within the 60-second deadline with a signed JSON decision.
+ * within the 60-second deadline with a signed JSON decision. Signed
+ * non-task requests (preflight/probes) get HTTP 200 — the platform requires
+ * 200 for its signed preflight (a strict type check made preflight fail
+ * with 400 on 2026-11-15, fixed by acking non-task requests).
  *
  * Flat layout (phone-friendly): every file lives at the repo root, no
  * subfolders. The circuit artifacts (gatekeeper.wasm / .zkey) are NOT in
@@ -107,7 +110,7 @@ function readBody(req) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', 'http://localhost');
-    if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/')) {
+    if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/' || url.pathname === '/preflight')) {
       return sendJson(res, 200, {
         status: 'ok',
         service: 'agent-games-gatekeeper',
@@ -117,7 +120,7 @@ const server = http.createServer(async (req, res) => {
         time: new Date().toISOString(),
       }, false);
     }
-    if (req.method !== 'POST' || (url.pathname !== '/' && url.pathname !== '/task' && url.pathname !== '/agent')) {
+    if (req.method !== 'POST' || (url.pathname !== '/' && url.pathname !== '/task' && url.pathname !== '/agent' && url.pathname !== '/preflight')) {
       return sendJson(res, 404, { error: 'not_found' }, false);
     }
     const raw = await readBody(req);
@@ -126,11 +129,31 @@ const server = http.createServer(async (req, res) => {
       log({ level: 'warn', msg: 'hmac_rejected', path: url.pathname });
       return sendJson(res, 401, { error: 'invalid_signature' }, false);
     }
+    // Empty body + valid HMAC: a preflight/probe, not an error.
+    if (raw.length === 0) {
+      log({ msg: 'preflight_empty_body', path: url.pathname });
+      return sendJson(res, 200, { status: 'ok', preflight: true, service: 'agent-games-gatekeeper', time: new Date().toISOString() }, true);
+    }
     let envelope;
     try {
       envelope = JSON.parse(raw.toString('utf8'));
     } catch {
       return sendJson(res, 400, { error: 'invalid_json' }, true);
+    }
+    // Preflight / probe requests: the platform sends a SIGNED request that is
+    // NOT a task envelope and requires HTTP 200. Anything that does not look
+    // like a task envelope gets a 200 ack; only malformed TASK envelopes
+    // (task_id/input present but wrong shape) keep the strict 400.
+    const looksLikeTask = envelope && typeof envelope === 'object' &&
+      (envelope.task_id !== undefined || envelope.input !== undefined);
+    const isPreflightShape = envelope && typeof envelope === 'object' && (
+      (typeof envelope.type === 'string' && envelope.type.toLowerCase().includes('preflight')) ||
+      envelope.preflight === true ||
+      envelope.action === 'preflight' ||
+      envelope.mode === 'preflight');
+    if (url.pathname === '/preflight' || isPreflightShape || !looksLikeTask) {
+      log({ msg: 'preflight_ack', path: url.pathname, type: envelope && envelope.type });
+      return sendJson(res, 200, { status: 'ok', preflight: true, service: 'agent-games-gatekeeper', time: new Date().toISOString() }, true);
     }
     if (!envelope || typeof envelope !== 'object' || envelope.type !== 'agent-games.proof-gatekeeper.v1') {
       return sendJson(res, 400, { error: 'unsupported_envelope', type: envelope && envelope.type }, true);
