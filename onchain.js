@@ -1,4 +1,3 @@
-'use strict';
 /**
  * STUB — on-chain proof confirmation.
  *
@@ -29,10 +28,12 @@
  * either a read-only zkVerifyJS session querying the verification state for
  * proof_tx, or Kurier job-status polling with an API key — and flip the
  * default mode only once it is proven against real practice tasks.
+ *
+ * ESM conversion of the standalone Gatekeeper onchain.js; logic unchanged.
  */
-const MODE = (process.env.ZKVERIFY_CHECK_MODE || 'stub').toLowerCase();
+export const MODE = (process.env.ZKVERIFY_CHECK_MODE || 'stub').toLowerCase();
 
-async function verifyProofOnChain(/* { proof_tx, proof_vk, registered_vk } */) {
+export async function verifyProofOnChain(/* { proof_tx, proof_vk, registered_vk } */) {
   if (MODE === 'mock') {
     return { verified: true, source: 'mock', detail: 'MOCK MODE: local testing only, no chain query performed.' };
   }
@@ -45,5 +46,3 @@ async function verifyProofOnChain(/* { proof_tx, proof_vk, registered_vk } */) {
     detail: 'STUB: no read-only on-chain query implemented; failing closed. See lib/onchain.js TODO.',
   };
 }
-
-module.exports = { verifyProofOnChain, MODE };

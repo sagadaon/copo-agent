@@ -1,80 +1,63 @@
-# Proof Gatekeeper — Agent Games (zkVerify Season 01)
+# Agent Games — Combined Endpoint (Proof Gatekeeper + Steal the VFY)
 
-Plain Node.js endpoint. The platform POSTs a signed task envelope; this
-server verifies the HMAC signature, decides APPROVE / REJECT against the
-7 documented trap types, attaches a Groth16 proof for the decision, and
-responds with a signed JSON decision — all inside the 60-second deadline.
+One process, one URL, both tracks. The platform dispatches Gatekeeper task
+envelopes AND Steal turn envelopes to the single registered endpoint, so
+this server routes purely by envelope shape after HMAC verification:
 
-Flat layout on purpose: every file lives at the repo root, no subfolders,
-so the repo can be managed from a phone. There is intentionally no
-Dockerfile — Railway's Node builder is the deploy path.
+1. Preflight markers → protocol-v1 preflight ack (`{"ok":true,"protocolVersion":"v1"}`, signed)
+2. Looks like a Steal turn (`matchId` / `turn` / `eventId: steal-the-vfy`) → Steal handler
+3. Looks like a Gatekeeper task (`agent-games.proof-gatekeeper.v1` / `task_id` / `input`) → decision engine
+4. Anything else signed → preflight ack
 
-## Files
+POST is accepted on `/`, `/task`, `/agent`, `/preflight`. GET `/`, `/health`,
+`/preflight` returns service status (including `steal_configured` and the
+public strategy `commitment` hex).
+
+## Files (flat — no subfolders)
 
 | File | What it is |
-| --- | --- |
-| `server.js` | HTTP server, HMAC verify-before-parse, signed responses |
-| `decide.js` | The 7 checks in trap-detection order, fail-closed |
-| `prove.js` | Groth16 proving + circuit auto-download (hash-verified) |
-| `seen.js` | File-backed seen-set for PROOF_REUSED detection |
-| `onchain.js` | On-chain confirmation — currently a marked STUB (see below) |
-| `package.json` | `npm start` runs the server; only dependency is `snarkjs` |
-| `.env.example` | Env vars to set on Railway (never commit a real `.env`) |
+|---|---|
+| `server.js` | Combined HTTP server, HMAC verify, shape routing, lazy Steal init |
+| `decide.js` | Gatekeeper decision engine (7 checks, fail-closed) |
+| `prove.js` | Gatekeeper Groth16 proving + circuit auto-download (pinned SHA-256) |
+| `seen.js` | Proof-reference seen-set (PROOF_REUSED detection) |
+| `onchain.js` | STUB on-chain check (`ZKVERIFY_CHECK_MODE`: stub/mock/disabled) |
+| `steal-handler.js` | Steal turn handling: validation, decision tree, proving, cache |
+| `strategy.js` | Deterministic Steal decision tree + Poseidon commitment |
+| `hash.js` | `publicInputsHash` (verified formula from the official docs) |
+| `prover.js` | Steal Groth16 proving + circuit auto-download (pinned SHA-256) |
+| `kurier.js` | Optional Kurier audit submission (best-effort, key-gated) |
+| `config.js` | Steal environment config (fail-fast; wrapped by the server) |
+| `commitment.js` | CLI: print the strategy commitment hash for dashboard registration |
 
-## Deploy (Railway)
-
-1. Create a GitHub repo and upload all files in this zip to its root.
-2. Railway → New Project → Deploy from GitHub repo → pick the repo.
-3. Railway → service → Variables, set:
-   - `HMAC_SECRET` — the 32-byte secret shown exactly ONCE when the
-     endpoint is registered in the Agent Games dashboard. Paste it here
-     directly; never send it through chat.
-   - `ZKVERIFY_CHECK_MODE` — leave unset (`stub`, fail-closed) until the
-     practice-mode decision below is made.
-4. Railway → service → Settings → Networking → Generate Domain. Copy the
-   `https://….up.railway.app` URL.
-5. Agent Games dashboard → register the endpoint URL → run the signed
-   preflight → run at least 1 practice task.
-6. Keep the service awake during scored rounds (17:30–03:30 WIB).
-
-Circuit artifacts (`gatekeeper.wasm`, `gatekeeper_final.zkey`) are NOT in
-the repo. On first start the server downloads them from
-`agentgames.zkverify.io/circuits/` and verifies them against pinned
-SHA-256 hashes (see `prove.js`). No manual step needed.
-
-Optional: attach a Railway Volume mounted at `/data` and set
-`SEEN_FILE=/data/seen.json` so the seen-set survives restarts. Without it,
-a restart only weakens reuse detection; it never causes a wrong APPROVE.
-
-## Practice-mode validation checklist
-
-These five things can only be confirmed against a real practice task.
-Check them before the first scored round:
-
-1. **taskId encoding** — the code encodes it as `sha256(task_id) mod p`.
-   `taskId` is a public signal, so the platform recomputes it. If the
-   encoding differs, proofs still verify cryptographically but the public
-   inputs mismatch (decisions still score; only the proof bonus is lost).
-2. **Proof field names** — the code sends `proof` + `public_signals`.
-   Confirm the platform accepts them.
-3. **HMAC encoding** — hex is assumed, base64 also accepted. Confirm
-   against a real signed request.
-4. **On-chain check mode** — `onchain.js` is a stub: no read-only query
-   path could be verified from the public docs. `stub` mode fails closed
-   (valid tasks get REJECT/UNVERIFIED, so valid-task points are lost).
-   `disabled` mode decides on the HMAC-authenticated envelope fields
-   alone. Choose only after practice tasks show the envelopes behave as
-   documented.
-5. **Preflight format** — `GET /` and `GET /health` return 200 JSON.
-   Adjust if the platform expects otherwise.
-
-## Local test
+## Setup
 
 ```sh
-npm install
-HMAC_SECRET=test-secret ZKVERIFY_CHECK_MODE=mock node server.js
-curl localhost:3000/health
+npm ci
 ```
 
-`mock` mode simulates a confirmed proof — local testing only, never
-deploy with it.
+Set Variables on Railway (see `.env.example`):
+
+- `AGENT_GAMES_HMAC_SECRET` (or `HMAC_SECRET`) — from the dashboard, shown once.
+- `ZKVERIFY_CHECK_MODE` — `disabled` for scored rounds (default `stub`
+  fail-closes and rejects every valid task).
+- `STRATEGY_PARAMS` — default `10,30,0,0,0,0,0,0`.
+- `STRATEGY_SALT` — required for Steal. If missing, Steal turns return 503
+  and Gatekeeper keeps working. The commitment hash in `/health` must match
+  the hash registered in the dashboard (recompute with `npm run commitment`
+  after any params/salt change, and re-register before the next round).
+
+Deploy: upload all files to the repo root (no folders), connect the repo to
+a Railway service, Generate Domain, register the URL in the dashboard, run
+preflight, then at least one practice task per track.
+
+## Notes
+
+- Circuit artifacts (`gatekeeper.*`, `vfy-policy.*`) are NOT in the repo.
+  They download from the official site on first start and are verified
+  against pinned SHA-256 hashes.
+- The Steal strategy is deterministic per the circuit: exactly one valid
+  action per state. The only adaptivity is re-committing between rounds.
+- `ZKVERIFY_CHECK_MODE=stub` is the default and rejects all valid Gatekeeper
+  tasks (fail-closed). The on-chain check is a stub; `disabled` is the
+  operator's choice after practice-mode validation.

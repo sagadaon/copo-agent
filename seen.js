@@ -1,4 +1,3 @@
-'use strict';
 /**
  * Seen-set for proof references (PROOF_REUSED detection).
  *
@@ -8,11 +7,13 @@
  * (e.g. /data/seen.json) for restarts to keep the set. Losing the file only
  * weakens reuse detection after a restart; it never causes a wrong APPROVE
  * on its own, because reuse is only one of the checks.
+ *
+ * ESM conversion of the standalone Gatekeeper seen.js; logic unchanged.
  */
-const fs = require('fs');
-const path = require('path');
+import fs from 'node:fs';
+import path from 'node:path';
 
-function loadSeenSet(filePath) {
+export function loadSeenSet(filePath) {
   const set = new Set();
   const abs = path.resolve(filePath);
   try {
@@ -41,5 +42,3 @@ function loadSeenSet(filePath) {
     add: (k) => { if (!set.has(k)) { set.add(k); persist(); } },
   };
 }
-
-module.exports = { loadSeenSet };

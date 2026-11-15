@@ -1,46 +1,57 @@
-'use strict';
 /**
- * Agent Games (zkVerify Season 01) — Proof Gatekeeper endpoint.
+ * Agent Games (zkVerify Season 01) — COMBINED endpoint: Proof Gatekeeper +
+ * Steal the VFY in one process, one URL.
  *
- * Plain Node.js, no framework. The platform POSTs a signed task envelope
- * (type "agent-games.proof-gatekeeper.v1") to this endpoint; we verify the
- * HMAC signature against the RAW body BEFORE parsing, decide, and respond
- * within the 60-second deadline with a signed JSON decision. Signed
- * non-task requests (preflight/probes) get HTTP 200 — the platform requires
- * 200 for its signed preflight (a strict type check made preflight fail
- * with 400 on 2026-11-15, fixed by acking non-task requests).
+ * The platform dispatches BOTH track envelopes to ONE registered endpoint,
+ * so this server routes purely by envelope shape after HMAC verification:
+ *   (a) preflight markers  -> protocol-v1 preflight ack (exact body, signed)
+ *   (b) looks-like-turn    -> Steal the VFY handler (strategy + policy proof)
+ *   (c) looks-like-task    -> Proof Gatekeeper decision engine
+ *   (d) anything else      -> preflight ack
+ *
+ * Plain Node.js, no framework. HMAC signature is verified against the RAW
+ * body BEFORE parsing. All responses that carry a decision/turn/preflight
+ * are signed with x-agent-games-signature (HMAC-SHA256 hex over the raw
+ * response body).
+ *
+ * LAZY STEAL INIT: the server NEVER fails startup when STRATEGY_SALT is
+ * missing. Gatekeeper + preflight keep working; Steal turns return 503
+ * {error:'steal_not_configured'} until the handler exists.
  *
  * Flat layout (phone-friendly): every file lives at the repo root, no
- * subfolders. The circuit artifacts (gatekeeper.wasm / .zkey) are NOT in
- * the repo — they are downloaded from the official site on first start
- * and verified against pinned SHA-256 hashes (see prove.js).
+ * subfolders. Circuit artifacts are NOT in the repo — they are downloaded
+ * from the official site on first start and verified against pinned SHA-256
+ * hashes (see prove.js / prover.js).
  *
  * Env vars:
- *   HMAC_SECRET          32-byte secret issued at registration (REQUIRED in production)
- *   PORT                 listen port (default 3000; Railway injects its own)
- *   SEEN_FILE            path for the file-backed seen-set (default ./data/seen.json)
- *   ZKVERIFY_CHECK_MODE  stub (default, fail-closed) | mock (local tests) | disabled
- *   PROOF_TIMEOUT_MS     proof-generation budget (default 50000)
- *   CIRCUITS_DIR         override for the circuit artifacts dir (default ./circuits)
- *
- * See README.md for setup, deployment, and the list of things that remain
- * blocked on registration + practice-mode validation.
+ *   AGENT_GAMES_HMAC_SECRET  32-byte secret (official name; REQUIRED in production)
+ *   HMAC_SECRET              fallback secret name (either one works)
+ *   PORT                     listen port (default 3000; Railway injects its own)
+ *   SEEN_FILE                path for the file-backed seen-set (default ./data/seen.json)
+ *   ZKVERIFY_CHECK_MODE      stub (default, fail-closed) | mock (local tests) | disabled
+ *   PROOF_TIMEOUT_MS         proof-generation budget (Gatekeeper default 50000; Steal default 240000)
+ *   STRATEGY_PARAMS          e.g. "10,30,0,0,0,0,0,0" (default: 10,30,0,0,0,0,0,0)
+ *   STRATEGY_SALT            REQUIRED for Steal; missing salt disables Steal only
+ *   KURIER_API_KEY           optional; enables Kurier audit submission (Steal)
+ *   CIRCUITS_DIR             override for the Gatekeeper circuit artifacts dir (default ./circuits)
  */
-const http = require('http');
-const crypto = require('crypto');
-const { decide } = require('./decide');
-const { loadSeenSet } = require('./seen');
-const { ensureCircuitsOnce } = require('./prove');
+import http from 'node:http';
+import crypto from 'node:crypto';
+import { decide } from './decide.js';
+import { loadSeenSet } from './seen.js';
+import { ensureCircuitsOnce as ensureGatekeeperCircuits } from './prove.js';
+import { loadConfig } from './config.js';
+import { createStealHandler } from './steal-handler.js';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const HMAC_SECRET = process.env.HMAC_SECRET || '';
-const HMAC_CONFIGURED = HMAC_SECRET.length > 0;
-const MAX_BODY_BYTES = 1024 * 1024; // 1 MiB — task envelopes are small
+const ENV_SECRET = process.env.AGENT_GAMES_HMAC_SECRET || process.env.HMAC_SECRET || '';
+const HMAC_CONFIGURED = ENV_SECRET.length > 0;
+const MAX_BODY_BYTES = 1024 * 1024; // 1 MiB — task/turn envelopes are small
 
 if (!HMAC_CONFIGURED) {
-  console.log(JSON.stringify({ level: 'warn', msg: 'HMAC_SECRET is not set — using a dummy secret for LOCAL TESTING ONLY. Never deploy like this.' }));
+  console.log(JSON.stringify({ level: 'warn', msg: 'No HMAC secret set (AGENT_GAMES_HMAC_SECRET/HMAC_SECRET) — using a dummy secret for LOCAL TESTING ONLY. Never deploy like this.' }));
 }
-const SECRET = HMAC_CONFIGURED ? HMAC_SECRET : 'local-test-only-dummy-secret-do-not-deploy';
+const SECRET = HMAC_CONFIGURED ? ENV_SECRET : 'local-test-only-dummy-secret-do-not-deploy';
 
 // Protocol-v1 preflight handshake (official /build spec): the platform sends
 // a signed preflight request and requires EXACTLY this body, signed with
@@ -60,14 +71,15 @@ function hmacHex(secret, buf) {
 
 /**
  * Verify x-agent-games-signature over the raw request body.
- * Accepts hex (64 chars) or base64 encoding — the public docs do not state
- * the encoding, so both are tried. Comparison is timing-safe. Either way the
- * attacker needs the secret, so accepting both encodings is not a hole.
+ * Accepts hex (64 chars, optional "sha256=" prefix) or base64 encoding —
+ * the public docs do not state the encoding, so all are tried. Comparison
+ * is timing-safe. Either way the attacker needs the secret, so accepting
+ * multiple encodings is not a hole.
  */
 function verifySignature(rawBody, headerValue) {
   if (!headerValue) return false;
   const expected = crypto.createHmac('sha256', SECRET).update(rawBody).digest();
-  const v = String(headerValue).trim();
+  const v = String(headerValue).trim().replace(/^sha256=/i, '');
   let provided;
   try {
     if (/^[0-9a-fA-F]{64}$/.test(v)) provided = Buffer.from(v, 'hex');
@@ -91,6 +103,15 @@ function sendJson(res, status, obj, sign) {
   res.end(body);
 }
 
+function sendCached(res, cached) {
+  res.writeHead(200, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(cached.body),
+    'x-agent-games-signature': cached.signature,
+  });
+  res.end(cached.body);
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -112,16 +133,44 @@ function readBody(req) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Lazy Steal init — never kills the process. A missing STRATEGY_SALT (or a
+// failed circuit download) only disables Steal; Gatekeeper keeps working.
+// ---------------------------------------------------------------------------
+let stealHandler = null;
+let stealInitError = null;
+let stealInitPromise = null;
+
+function initSteal() {
+  if (!stealInitPromise) {
+    stealInitPromise = (async () => {
+      try {
+        const stealConfig = loadConfig();
+        stealHandler = await createStealHandler(stealConfig);
+        log({ msg: 'steal_ready', commitment: stealHandler.commitmentHex });
+      } catch (e) {
+        stealInitError = e;
+        log({ level: 'warn', msg: 'steal_not_configured', error: String(e.message) });
+      }
+    })();
+  }
+  return stealInitPromise;
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', 'http://localhost');
     if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/' || url.pathname === '/preflight')) {
       return sendJson(res, 200, {
         status: 'ok',
-        service: 'agent-games-gatekeeper',
+        service: 'agent-games-combined',
+        protocolVersion: 'v1',
         uptime_s: Math.floor((Date.now() - startedAt) / 1000),
         hmac_configured: HMAC_CONFIGURED,
         seen_count: seen.size,
+        steal_configured: stealHandler !== null,
+        commitment: stealHandler ? stealHandler.commitmentHex : null,
+        turnsServed: stealHandler ? stealHandler.turnsServed : 0,
         time: new Date().toISOString(),
       }, false);
     }
@@ -145,35 +194,77 @@ const server = http.createServer(async (req, res) => {
     } catch {
       return sendJson(res, 400, { error: 'invalid_json' }, true);
     }
-    // Preflight / probe requests: the platform sends a SIGNED request that is
-    // NOT a task envelope and requires HTTP 200. Anything that does not look
-    // like a task envelope gets a 200 ack; only malformed TASK envelopes
-    // (task_id/input present but wrong shape) keep the strict 400.
-    const looksLikeTask = envelope && typeof envelope === 'object' &&
-      (envelope.task_id !== undefined || envelope.input !== undefined);
-    const isPreflightShape = envelope && typeof envelope === 'object' && (
+
+    const isObject = envelope && typeof envelope === 'object';
+    // (a) Preflight markers — the platform's signed handshake, any shape.
+    const isPreflightShape = isObject && (
       (typeof envelope.type === 'string' && envelope.type.toLowerCase().includes('preflight')) ||
       envelope.preflight === true ||
       envelope.action === 'preflight' ||
       envelope.mode === 'preflight');
-    if (url.pathname === '/preflight' || isPreflightShape || !looksLikeTask) {
-      log({ msg: 'preflight_ack', path: url.pathname, type: envelope && envelope.type });
+    if (isPreflightShape) {
+      log({ msg: 'preflight_ack', path: url.pathname, type: envelope.type });
       return sendJson(res, 200, PREFLIGHT_BODY, true);
     }
-    if (!envelope || typeof envelope !== 'object' || envelope.type !== 'agent-games.proof-gatekeeper.v1') {
-      return sendJson(res, 400, { error: 'unsupported_envelope', type: envelope && envelope.type }, true);
+    // (b) Looks like a Steal turn.
+    const looksLikeTurn = isObject && (
+      envelope.matchId !== undefined ||
+      envelope.turn !== undefined ||
+      envelope.eventId === 'steal-the-vfy');
+    if (looksLikeTurn) {
+      if (!stealHandler) {
+        // Init may still be downloading circuits: wait for it to settle
+        // (fast failure when the salt is missing). Never hang a turn on a
+        // retry loop — one settled attempt decides it.
+        await initSteal();
+      }
+      if (!stealHandler) {
+        log({ level: 'warn', msg: 'steal_turn_rejected_not_configured', matchId: envelope.matchId, turn: envelope.turn });
+        return sendJson(res, 503, { error: 'steal_not_configured' }, false);
+      }
+      const problems = stealHandler.validateTurnEnvelope(envelope);
+      if (problems.length > 0) {
+        return sendJson(res, 400, { error: 'invalid turn envelope', problems }, false);
+      }
+      const result = await stealHandler.handleTurn(envelope);
+      if (result.cached) return sendCached(res, result.cached);
+      const body = JSON.stringify(result.body);
+      if (result.cache && result.status === 200) {
+        const signature = hmacHex(SECRET, body);
+        stealHandler.cacheResponse(envelope.matchId, envelope.turn, body, signature);
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'x-agent-games-signature': signature,
+        });
+        return res.end(body);
+      }
+      return sendJson(res, result.status, result.body, Boolean(result.sign));
     }
-    const t0 = Date.now();
-    const result = await decide(envelope, seen);
-    log({
-      msg: 'decision',
-      task_id: envelope.task_id,
-      decision: result.decision,
-      reason_code: result.reason_code,
-      proof_included: !!result.proof,
-      ms: Date.now() - t0,
-    });
-    return sendJson(res, 200, result, true);
+    // (c) Looks like a Gatekeeper task.
+    const looksLikeTask = isObject && (
+      envelope.type === 'agent-games.proof-gatekeeper.v1' ||
+      envelope.task_id !== undefined ||
+      envelope.input !== undefined);
+    if (looksLikeTask) {
+      if (envelope.type !== 'agent-games.proof-gatekeeper.v1') {
+        return sendJson(res, 400, { error: 'unsupported_envelope', type: envelope.type }, true);
+      }
+      const t0 = Date.now();
+      const result = await decide(envelope, seen);
+      log({
+        msg: 'decision',
+        task_id: envelope.task_id,
+        decision: result.decision,
+        reason_code: result.reason_code,
+        proof_included: !!result.proof,
+        ms: Date.now() - t0,
+      });
+      return sendJson(res, 200, result, true);
+    }
+    // (d) Anything else: signed probe — preflight ack.
+    log({ msg: 'preflight_ack', path: url.pathname, type: isObject ? envelope.type : typeof envelope });
+    return sendJson(res, 200, PREFLIGHT_BODY, true);
   } catch (err) {
     log({ level: 'error', msg: 'handler_error', error: String((err && err.message) || err) });
     if (!res.headersSent) return sendJson(res, 500, { error: 'internal_error' }, false);
@@ -182,10 +273,19 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   log({ msg: 'listening', port: PORT, hmac_configured: HMAC_CONFIGURED });
-  // Fetch the circuit artifacts in the background; the health endpoint
-  // already answers. Proof calls re-check via the same memoized promise,
-  // so a slow download only delays proofs, never the server itself.
-  ensureCircuitsOnce()
-    .then(() => log({ msg: 'circuits_ready' }))
-    .catch((e) => log({ level: 'error', msg: 'circuits_not_ready', error: String(e.message) }));
+  // Fetch the Gatekeeper circuit artifacts in the background; the health
+  // endpoint already answers. Proof calls re-check via the same memoized
+  // promise, so a slow download only delays proofs, never the server.
+  ensureGatekeeperCircuits()
+    .then(() => log({ msg: 'gatekeeper_circuits_ready' }))
+    .catch((e) => log({ level: 'error', msg: 'gatekeeper_circuits_not_ready', error: String(e.message) }));
+  // Steal init runs in the background too and must never kill the process.
+  initSteal();
 });
+
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    log({ msg: 'shutdown', signal: sig });
+    server.close(() => process.exit(0));
+  });
+}

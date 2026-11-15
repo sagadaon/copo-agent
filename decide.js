@@ -1,4 +1,3 @@
-'use strict';
 /**
  * Proof Gatekeeper decision engine — the 7 checks from the event page,
  * evaluated in trap-detection order. Fail closed: any uncertainty,
@@ -23,9 +22,11 @@
  * REJECT/UNVERIFIED. If proof generation TIMES OUT after a confident
  * decision, the decision is still returned without a proof (the decision
  * itself is certain; only the reliability bonus is at risk).
+ *
+ * ESM conversion of the standalone Gatekeeper decide.js; logic unchanged.
  */
-const { verifyProofOnChain } = require('./onchain');
-const { generateDecisionProof } = require('./prove');
+import { verifyProofOnChain } from './onchain.js';
+import { generateDecisionProof } from './prove.js';
 
 const PROOF_TIMEOUT_MS = parseInt(process.env.PROOF_TIMEOUT_MS || '50000', 10);
 
@@ -52,7 +53,7 @@ function withTimeout(promise, ms) {
     .finally(() => clearTimeout(timer));
 }
 
-async function decide(envelope, seen) {
+export async function decide(envelope, seen) {
   const input = (envelope && envelope.input) || {};
   const taskId = envelope.task_id;
   const proofTx = typeof input.proof_tx === 'string' ? input.proof_tx : null;
@@ -154,5 +155,3 @@ async function tryProve(task, decision) {
     return null;
   }
 }
-
-module.exports = { decide };

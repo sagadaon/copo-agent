@@ -1,4 +1,3 @@
-'use strict';
 /**
  * Groth16 proof generation for the tournament's gatekeeper circuit
  * (BN254 / bn128, Circom 2.x), using the official artifacts.
@@ -22,12 +21,17 @@
  * CIRCUIT ARTIFACTS — not committed to the repo. On first use they are
  * downloaded from the tournament's own site and verified against the
  * pinned SHA-256 hashes below (hashes measured from the official files).
+ *
+ * ESM conversion of the standalone Gatekeeper prove.js; logic unchanged.
  */
-const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
-const https = require('https');
-const snarkjs = require('snarkjs');
+import path from 'node:path';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+import https from 'node:https';
+import { fileURLToPath } from 'node:url';
+import * as snarkjs from 'snarkjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // BN254 scalar field prime.
 const P = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
@@ -96,7 +100,7 @@ function downloadFile(url, dest, redirectsLeft = 3) {
   });
 }
 
-async function ensureCircuits() {
+export async function ensureCircuits() {
   fs.mkdirSync(CIRCUITS_DIR, { recursive: true });
   for (const f of CIRCUIT_FILES) {
     const dest = path.join(CIRCUITS_DIR, f.name);
@@ -120,29 +124,29 @@ async function ensureCircuits() {
 // Memoized: concurrent callers share one download. On failure the memo
 // resets so the next call retries.
 let ensuring = null;
-function ensureCircuitsOnce() {
+export function ensureCircuitsOnce() {
   if (!ensuring) ensuring = ensureCircuits().catch((e) => { ensuring = null; throw e; });
   return ensuring;
 }
 
-function fieldFromHex(hex) {
+export function fieldFromHex(hex) {
   return (BigInt(String(hex).trim()) % P).toString();
 }
 
-function fieldFromAddress(addr) {
+export function fieldFromAddress(addr) {
   return BigInt(String(addr).trim()).toString();
 }
 
-function fieldFromTaskId(taskId) {
+export function fieldFromTaskId(taskId) {
   const h = crypto.createHash('sha256').update(String(taskId), 'utf8').digest('hex');
   return (BigInt('0x' + h) % P).toString();
 }
 
-function randomSalt() {
+export function randomSalt() {
   return (BigInt('0x' + crypto.randomBytes(32).toString('hex')) % P).toString();
 }
 
-async function generateDecisionProof(task, decision) {
+export async function generateDecisionProof(task, decision) {
   await ensureCircuitsOnce();
   const input = {
     registeredVkHash: fieldFromHex(task.registered_vk),
@@ -162,5 +166,3 @@ async function generateDecisionProof(task, decision) {
   const { proof, publicSignals } = await snarkjs.groth16.fullProve(input, WASM_PATH, ZKEY_PATH);
   return { proof, publicSignals: publicSignals.map(String) };
 }
-
-module.exports = { generateDecisionProof, ensureCircuits, ensureCircuitsOnce, fieldFromHex, fieldFromTaskId, randomSalt };
