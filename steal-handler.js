@@ -37,12 +37,15 @@ const FUTURE_SKEW_MS = 5 * 60 * 1000;
 const DEADLINE_MARGIN_MS = 15_000;
 const MIN_PROVE_BUDGET_MS = 5_000;
 
-/** Deterministic per (matchId, turn): retries reuse the key, turns never share one. */
+/** Deterministic per (matchId, turn): retries reuse the key, turns never share one.
+ *  Forces UUIDv4 version + variant bits — the platform validates the key as
+ *  a strict UUID, and raw hash slices fail (e.g. version nibble 'c'). */
 export function idempotencyKeyFor(matchId, turn) {
   const hash = createHash("sha256")
     .update(`agent-games:steal:${String(matchId)}:${String(turn)}`)
     .digest("hex");
-  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
+  const variant = ["8", "9", "a", "b"][parseInt(hash[16], 16) & 3];
+  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-${variant}${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
 }
 
 /**
@@ -239,8 +242,9 @@ export async function createStealHandler(config) {
         (decision.amount !== null ? ` amount=${decision.amount}` : ""),
     );
 
-    // Deadline budget for proving.
-    const deadlineMs = env.deadlineAt ? Date.parse(env.deadlineAt) : now + 300_000;
+    // Deadline budget for proving. Same parseTs as the freshness check:
+    // a numeric deadlineAt must not collapse the budget to HOLD.
+    const deadlineMs = env.deadlineAt ? parseTs(env.deadlineAt) : now + 300_000;
     const budgetMs = Math.min(
       config.proofTimeoutMs,
       (Number.isFinite(deadlineMs) ? deadlineMs : now + 300_000) - now - DEADLINE_MARGIN_MS,
