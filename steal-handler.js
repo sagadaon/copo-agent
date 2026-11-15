@@ -45,6 +45,42 @@ export function idempotencyKeyFor(matchId, turn) {
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
 }
 
+/**
+ * Normalize a Steal turn envelope: the platform's real field shapes were
+ * never published, so accept the documented names plus the obvious aliases
+ * and coerce types. Only matchId / turn / state balances are essential;
+ * metadata (protocolVersion, eventId, nonce, commitment echo) is tolerated
+ * in any shape — a signed turn must be answered, never 400'd over it.
+ */
+export function normalizeTurnEnvelope(env) {
+  const out = { ...env };
+  const matchId = env.matchId ?? env.match_id ?? env.matchID;
+  out.matchId = matchId === undefined || matchId === null ? "" : String(matchId);
+  const turnRaw = env.turn ?? env.turnNumber ?? env.turn_number;
+  out.turn = turnRaw === undefined || turnRaw === null ? turnRaw : Number(turnRaw);
+  if (env.state === undefined || env.state === null) {
+    if (env.gameState && typeof env.gameState === "object") {
+      out.state = env.gameState;
+    } else if (env.selfBalance !== undefined || env.opponentBalance !== undefined) {
+      out.state = { selfBalance: env.selfBalance, opponentBalance: env.opponentBalance };
+    }
+  }
+  const sc = env.strategyCommitment ?? env.commitment ?? env.strategyCommitmentHash;
+  if (typeof sc === "string") {
+    out.strategyCommitment = { hash: sc };
+  } else if (typeof sc === "number") {
+    out.strategyCommitment = { hash: String(sc) };
+  } else if (sc && typeof sc === "object" && typeof sc.hash !== "string" && typeof sc.commitment === "string") {
+    out.strategyCommitment = { hash: sc.commitment };
+  } else if (sc && typeof sc === "object" && typeof sc.hash === "string") {
+    out.strategyCommitment = sc;
+  } else {
+    out.strategyCommitment = undefined;
+  }
+  out.nonce = env.nonce ?? env.idempotencyKey ?? undefined;
+  return out;
+}
+
 export async function createStealHandler(config) {
   const paths = defaultPaths();
   // Circuit artifacts are not in the repo: download + hash-verify them
@@ -86,7 +122,7 @@ export async function createStealHandler(config) {
     });
     return {
       matchId,
-      turn,
+      turn: Number(turn),
       action: { type: "HOLD" }, // NEVER include amount for HOLD/FORTIFY
       policyProof: {
         circuitVersion: config.circuitVersion,
@@ -98,13 +134,15 @@ export async function createStealHandler(config) {
   }
 
   function validateTurnEnvelope(env) {
+    // Only the fields needed to decide + prove are required. Metadata
+    // (protocolVersion, eventId, nonce, commitment echo) is tolerated in
+    // any shape — the platform's real envelope was never published, and a
+    // signed turn must be answered, not rejected over a metadata field.
     const problems = [];
-    if (env.protocolVersion !== "v1") problems.push("protocolVersion must be 'v1'");
-    if (env.eventId !== "steal-the-vfy") problems.push("eventId must be 'steal-the-vfy'");
     if (typeof env.matchId !== "string" || env.matchId === "") {
       problems.push("matchId must be a non-empty string");
     }
-    if (env.turn === undefined || env.turn === null || !/^-?\d+$/.test(String(env.turn))) {
+    if (env.turn === undefined || env.turn === null || !Number.isInteger(env.turn)) {
       problems.push("turn must be an integer");
     }
     const st = env.state;
@@ -117,13 +155,6 @@ export async function createStealHandler(config) {
         }
       }
     }
-    const hash = env.strategyCommitment?.hash;
-    if (typeof hash !== "string" || !/^0x[0-9a-fA-F]+$/.test(hash)) {
-      problems.push("strategyCommitment.hash must be a 0x-hex string");
-    }
-    if (typeof env.nonce !== "string" || env.nonce === "") {
-      problems.push("nonce must be a non-empty string");
-    }
     return problems;
   }
 
@@ -132,15 +163,25 @@ export async function createStealHandler(config) {
     const cacheKey = `${String(matchId)}:${String(turn)}`;
     const now = Date.now();
 
-    // Freshness: reject expired / stale envelopes.
+    // Freshness: reject expired / stale envelopes. Timestamps may arrive
+    // as ISO strings or unix numbers (seconds or ms). Only reject when
+    // confidently parsed — an unreadable timestamp must not cost a turn.
+    const parseTs = (v) => {
+      if (typeof v === "number" && Number.isFinite(v)) return v < 1e12 ? v * 1000 : v;
+      if (typeof v === "string") {
+        const t = Date.parse(v);
+        return Number.isFinite(t) ? t : NaN;
+      }
+      return NaN;
+    };
     if (env.deadlineAt) {
-      const deadline = Date.parse(env.deadlineAt);
+      const deadline = parseTs(env.deadlineAt);
       if (Number.isFinite(deadline) && now > deadline) {
         return { status: 410, body: { error: "turn deadline already passed" } };
       }
     }
     if (env.issuedAt) {
-      const issued = Date.parse(env.issuedAt);
+      const issued = parseTs(env.issuedAt);
       if (Number.isFinite(issued)) {
         if (now - issued > STALE_ENVELOPE_MS) {
           return { status: 400, body: { error: "stale envelope (issuedAt too old)" } };
@@ -151,30 +192,44 @@ export async function createStealHandler(config) {
       }
     }
 
-    // Nonce replay guard + retry cache.
+    // Nonce replay guard + retry cache. The guard applies only when a
+    // nonce is actually present — nonce-less turns must never 409 each
+    // other through a shared undefined key.
     prune(seenNonces, now);
     prune(responseCache, now);
-    const prior = seenNonces.get(env.nonce);
+    const hasNonce = typeof env.nonce === "string" && env.nonce !== "";
+    const prior = hasNonce ? seenNonces.get(env.nonce) : undefined;
     if (prior && (prior.matchId !== matchId || String(prior.turn) !== String(turn))) {
       return { status: 409, body: { error: "nonce replay: nonce seen for a different turn" } };
     }
-    seenNonces.set(env.nonce, { matchId, turn, expiresAt: now + NONCE_TTL_MS });
+    if (hasNonce) seenNonces.set(env.nonce, { matchId, turn, expiresAt: now + NONCE_TTL_MS });
     const cached = responseCache.get(cacheKey);
     if (cached) return { status: 200, cached };
 
-    // Commitment check: the envelope's frozen hash must equal ours.
-    let envelopeCommitment;
-    try {
-      envelopeCommitment = BigInt(env.strategyCommitment.hash);
-    } catch {
-      return { status: 400, body: { error: "strategyCommitment.hash is not parseable" } };
+    // Commitment check: when the envelope echoes a parseable hash, it must
+    // equal ours (else HOLD). When absent/unparseable, warn and proceed
+    // with the server's own registered commitment — never 400 a turn
+    // over a missing echo.
+    const envelopeHash = env.strategyCommitment?.hash;
+    let envelopeCommitment = null;
+    if (typeof envelopeHash === "string" && envelopeHash !== "") {
+      try {
+        envelopeCommitment = BigInt(envelopeHash);
+      } catch {
+        envelopeCommitment = null;
+      }
     }
-    if (envelopeCommitment !== commitment) {
+    if (envelopeCommitment !== null && envelopeCommitment !== commitment) {
       console.error(
         `[turn ${matchId} #${turn}] COMMITMENT MISMATCH: envelope=${env.strategyCommitment.hash} computed=${commitmentHex}. ` +
           "Dashboard registration does not match STRATEGY_PARAMS/STRATEGY_SALT; falling back to HOLD. Re-register the commitment before the next round.",
       );
       return { status: 200, body: holdFallback(env), sign: true, cache: true };
+    }
+    if (envelopeCommitment === null) {
+      console.warn(
+        `[turn ${matchId} #${turn}] no parseable strategyCommitment echo; proceeding with server commitment ${commitmentHex}`,
+      );
     }
 
     const decision = decideAction(env.state, config.params);
@@ -248,7 +303,7 @@ export async function createStealHandler(config) {
 
     const body = {
       matchId,
-      turn: env.turn,
+      turn: Number(env.turn),
       action,
       policyProof,
       agentTimestamp: new Date().toISOString(),
@@ -265,6 +320,7 @@ export async function createStealHandler(config) {
       return turnsServed;
     },
     validateTurnEnvelope,
+    normalizeTurnEnvelope,
     handleTurn,
     /** Store a signed response body for (matchId, turn) retries. */
     cacheResponse(matchId, turn, body, signature) {

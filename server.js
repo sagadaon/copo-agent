@@ -209,7 +209,9 @@ const server = http.createServer(async (req, res) => {
     // (b) Looks like a Steal turn.
     const looksLikeTurn = isObject && (
       envelope.matchId !== undefined ||
+      envelope.match_id !== undefined ||
       envelope.turn !== undefined ||
+      envelope.turnNumber !== undefined ||
       envelope.eventId === 'steal-the-vfy');
     if (looksLikeTurn) {
       if (!stealHandler) {
@@ -222,16 +224,36 @@ const server = http.createServer(async (req, res) => {
         log({ level: 'warn', msg: 'steal_turn_rejected_not_configured', matchId: envelope.matchId, turn: envelope.turn });
         return sendJson(res, 503, { error: 'steal_not_configured' }, false);
       }
-      const problems = stealHandler.validateTurnEnvelope(envelope);
+      const turnEnv = stealHandler.normalizeTurnEnvelope(envelope);
+      const problems = stealHandler.validateTurnEnvelope(turnEnv);
+      // Diagnostic trace: envelope shape (keys + field types only, never
+      // values) + validation outcome, so a future rejection is diagnosable
+      // from the Railway logs without guessing the platform's envelope.
+      log({
+        msg: 'steal_turn_received',
+        keys: Object.keys(envelope),
+        turnField: typeof envelope.turn,
+        matchIdField: typeof envelope.matchId,
+        hasState: envelope.state !== undefined,
+        hasCommitment: envelope.strategyCommitment !== undefined,
+        hasNonce: envelope.nonce !== undefined,
+        problems,
+      });
       if (problems.length > 0) {
         return sendJson(res, 400, { error: 'invalid turn envelope', problems }, false);
       }
-      const result = await stealHandler.handleTurn(envelope);
+      let result;
+      try {
+        result = await stealHandler.handleTurn(turnEnv);
+      } catch (err) {
+        log({ level: 'error', msg: 'steal_turn_handler_error', matchId: turnEnv.matchId, turn: turnEnv.turn, error: err.message });
+        return sendJson(res, 500, { error: 'turn_handler_error' }, false);
+      }
       if (result.cached) return sendCached(res, result.cached);
       const body = JSON.stringify(result.body);
       if (result.cache && result.status === 200) {
         const signature = hmacHex(SECRET, body);
-        stealHandler.cacheResponse(envelope.matchId, envelope.turn, body, signature);
+        stealHandler.cacheResponse(turnEnv.matchId, turnEnv.turn, body, signature);
         res.writeHead(200, {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
